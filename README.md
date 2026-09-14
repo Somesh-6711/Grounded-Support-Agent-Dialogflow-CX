@@ -8,7 +8,7 @@ questions from a knowledge base instead of making them up.
 The interesting part isn't that it works. It's the failure I found while testing
 it, written up in full below.
 
-![The agent chaining two tool calls](docs/screenshots/05-outage-tool-trace.png)
+![The agent chaining two tool calls]("Images/Screenshot 2026-09-13 155336.png")
 
 ---
 
