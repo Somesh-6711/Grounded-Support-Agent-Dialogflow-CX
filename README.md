@@ -8,11 +8,14 @@ questions from a knowledge base instead of making them up.
 The interesting part isn't that it works. It's the failure I found while testing
 it, written up in full below.
 
-![The agent chaining two tool calls]("Images/Screenshot 2026-09-13 155336.png")
+![The agent chaining two tool calls](Images/11.png)
+
+*Given only an account ID, the agent looks up the account, reads the service ZIP
+out of that response, and passes it into the outage check. Nobody told it 11375.*
 
 ---
 
-## What this is, in plain English
+## What this is, in simple term
 
 Imagine the chat window on your internet provider's website. Traditionally that
 was a decision tree — press 1 for billing, press 2 for support — and it was
@@ -27,7 +30,7 @@ capabilities:
   The model decides *when* to call them and *what* to pass. The answer comes
   from your systems, not its imagination.
 - **A data store** — your actual policy documents, indexed so the model can
-  retrieve the relevant passage and answer from that, with a citation.
+  retrieve the relevant passage and answer from that.
 
 This repo is one of each, plus the agent that uses them, plus what I learned
 about where that arrangement breaks.
@@ -39,12 +42,9 @@ about where that arrangement breaks.
 ```mermaid
 flowchart TD
     C[Customer] --> P
-
     P[Playbook: Gemini reads instructions]
-
     P --> T1[OpenAPI tool: calls your REST API]
     P --> T2[Data store tool: retrieves from your docs]
-
     T1 --> S[Cloud Run service: FastAPI, this repo]
     T2 --> G[Cloud Storage: knowledge base HTML]
 ```
@@ -70,7 +70,6 @@ playbooks for the open-ended parts.
 | `openapi/playbook_instructions.md` | The playbook's goal and instructions |
 | `datastore/*.html` | Knowledge base documents used for grounding |
 | `tests/test_service.py` | 13 tests — happy paths, guardrail rejections, webhook contract |
-| `agent-export/` | Exported agent definition (playbooks, tools, config) |
 | `scripts/` | Enable APIs, deploy, upload knowledge base, smoke test |
 
 ---
@@ -91,19 +90,20 @@ call. They're production prompt surface and should be versioned like code.
 
 ---
 
-## What worked: the agent chains tools on its own
+## What worked: tool chaining and ordering constraints
 
-Given only `My internet is down, account OPT-20031877`, the agent:
+The trace at the top of this README shows the agent, given only
+`My internet is down, account OPT-20031877`:
 
-1. called `get_account_status` with that account ID
-2. read `service_zip: 11375` out of the response
-3. called `check_outage` with `11375`
-4. reported the active fiber cut, affected services, and restore time
+1. calling `get_account_status` with that account ID
+2. reading `service_zip: 11375` out of the response
+3. calling `check_outage` with `11375`
+4. reporting the active fiber cut, affected services, and restore time
 
-Nobody told it the ZIP code. It took one tool's output and fed it into the next
-tool's input. It also obeyed an ordering constraint in the instructions — check
-for an outage *before* offering troubleshooting — so it never suggested
-rebooting a router during a fiber cut.
+It took one tool's output and fed it into the next tool's input without being
+told to. It also obeyed an ordering constraint from the instructions — check for
+an outage *before* offering troubleshooting — so it never suggested rebooting a
+router during a fiber cut.
 
 Latency in that trace: **4.497s** on the first call, **0.051s** on the second.
 That's a Cloud Run cold start against a warm request, roughly 90x. It's the
@@ -112,33 +112,76 @@ voice call is a hangup.
 
 ---
 
+## What worked: the write path stays behind a human
+
+Booking a technician dispatches a truck, so it's gated. The agent calls
+`list_appointment_slots` and offers a real window rather than inventing one:
+
+![Agent offering real appointment slots](Images/9.png)
+
+Only after the customer agrees does it call `schedule_technician` with
+`confirm: true`:
+
+![Booking confirmed with a confirmation number](Images/8.png)
+
+The gate is enforced in the API, not just the prompt. `schedule_technician`
+returns `409 confirmation_required` unless `confirm` is true:
+
+```bash
+curl -X POST $SVC/tools/schedule-technician \
+  -H 'Content-Type: application/json' \
+  -d '{"account_id":"OPT-10045512","preferred_date":"2026-09-14","window":"08:00-12:00","confirm":false}'
+
+# HTTP 409
+# {"ok":false,"error_code":"confirmation_required",
+#  "message":"This action changes the customer's account. Ask the customer to
+#             confirm in their own words, then call again with confirm=true."}
+```
+
+The rejection message tells the model what to do next, so it self-corrects
+rather than stalling. Covered by `test_schedule_requires_confirmation` and
+`test_schedule_rejects_invented_slot` in `tests/test_service.py`.
+
+Delete the confirmation line from the playbook instructions entirely and the API
+still refuses. That distinction turns out to matter — see below.
+
+---
+
 ## What broke: the agent skipped retrieval where it felt confident
 
 The instructions told it to pull troubleshooting steps from the knowledge base.
 It ignored that and answered from its own training data.
 
-**Before:**
+![Trace showing no data store call](Images/10.png)
 
-![Agent answering from training data](docs/screenshots/10a-before-no-retrieval.png)
+Two tool calls in that trace — `get_account_status` and `check_outage` — and
+**no `search_support_kb`**. It went straight to "have you tried restarting your
+modem and router?"
 
-No `search_support_kb` call in the trace. It advised unplugging the modem for
-**30 seconds**. The knowledge base says **60 seconds**, modem back in first,
-wait for the online light to go solid. Close enough to sound right, different
-enough to be wrong.
+Pushed further, it invented a procedure:
 
-The data store itself was fine. A question the model *couldn't* know was
-answered correctly, with retrieval and a citation:
+![Agent giving generic troubleshooting advice](Images/7.png)
 
-![Correct retrieval from the data store](docs/screenshots/07-datastore-citation.png)
+It advised unplugging for **30 seconds**. The knowledge base says **60 seconds**,
+modem back in first, wait for the online light to go solid. Close enough to
+sound right, different enough to be wrong — and if this were real, that's a
+customer being told the wrong thing by a bot speaking in the company's voice.
+
+The data store itself was working fine. A question the model *couldn't* know was
+answered correctly, with retrieval:
+
+![Correct retrieval from the data store](Images/6.png)
 
 So the pattern isn't random. **The model retrieves when it feels uncertain and
-skips when it feels confident.** Which means retrieval gets skipped exactly
-where the model's general knowledge overlaps your domain — and that overlap is
-where your documented procedure differs from the generic answer in small,
-plausible ways. The worst possible place to lose grounding.
+skips when it feels confident.** Which means retrieval gets skipped exactly where
+the model's general knowledge overlaps your domain — and that overlap is where
+your documented procedure differs from the generic answer in small, plausible
+ways. The worst possible place to lose grounding.
 
-**The fix** was to make the instruction a precondition rather than a suggestion,
-and to name the prohibition explicitly:
+### The fix
+
+Make the instruction a precondition rather than a suggestion, and name the
+prohibition explicitly:
 
 ```
 - If there is no active outage, you MUST call ${TOOL: search_support_kb} before
@@ -149,9 +192,15 @@ and to name the prohibition explicitly:
   that issue and offer a technician visit.
 ```
 
-**After:**
+Four changes, each doing specific work: `MUST call ... before` makes it a
+precondition; the explicit prohibition closes the "I already know this" path;
+`in the order returned` stops it paraphrasing the procedure into a different
+one; the fallback gives it a legal move when retrieval comes back empty, so it
+isn't forced to improvise.
 
-![Agent retrieving before answering](docs/screenshots/10b-after-retrieval.png)
+Re-running the same question after the change produced the `search_support_kb`
+call and the correct steps. I didn't capture that trace before tearing the
+project down, so the screenshot isn't here.
 
 ---
 
@@ -162,25 +211,39 @@ and to name the prohibition explicitly:
 | Prompt instruction | "use the data store for troubleshooting" | **Ignored.** The model decided it already knew. |
 | API contract | `confirm: true` required to book a technician | **Cannot be ignored.** HTTP 409 regardless. |
 
-The booking endpoint returns `409 confirmation_required` unless `confirm` is
-true, and the rejection message tells the model what to do next so it
-self-corrects rather than stalling:
-
-![Guardrail rejecting an unconfirmed booking](docs/screenshots/06a-forced-409.png)
-
-Delete the confirmation line from the playbook instructions entirely and the API
-still refuses. That's the difference between a guardrail and a request.
-
-Here's the agent doing it correctly — offering a real slot from
-`list_appointment_slots`, waiting for agreement, then booking:
-
-![Successful booking after confirmation](docs/screenshots/06b-confirmed-booking.png)
-
 The honest limitation: you can put a *confirmation* requirement in an API
 contract, but you cannot put a *retrieval* requirement there. Nothing stops a
 model from answering without calling a tool. The only controls are instruction
 strength and measurement after the fact — which is why evaluation harnesses
 exist, and why "we told it to use the knowledge base" isn't an answer.
+
+---
+
+## Console configuration
+
+**Tools registered** — an OpenAPI tool and a data store tool:
+
+![Tools list](Images/5.png)
+
+**The OpenAPI tool.** The schema from `openapi/tools.yaml` registers five
+callable actions keyed by `operationId`. The test panel on the right calls the
+live Cloud Run service:
+
+![OpenAPI tool configuration](Images/4.png)
+
+**The data store tool**, grounding policy answers on the knowledge base in
+`datastore/`:
+
+![Data store tool configuration](Images/3.png)
+
+**The playbook goal** — what the agent is for, in plain English:
+
+![Playbook goal](Images/2.png)
+
+**Tools attached to the playbook.** A tool the playbook can't see is a tool the
+model can't call, which is the first thing to check when an agent ignores one:
+
+![Playbook available tools](Images/1.png)
 
 ---
 
@@ -215,19 +278,6 @@ instructions from `openapi/playbook_instructions.md` into the playbook.
 
 **Sequencing note:** start the data store first. Indexing takes 10–30 minutes
 and runs unattended, so kick it off and build everything else while it churns.
-
----
-
-## Console configuration
-
-| | |
-|---|---|
-| Tools registered | ![Tools list](docs/screenshots/01-tools-list.png) |
-| OpenAPI tool | ![OpenAPI schema](docs/screenshots/02-openapi-tool.png) |
-| Data store | ![Indexed documents](docs/screenshots/03-datastore-documents.png) |
-| Playbook | ![Playbook instructions](docs/screenshots/04-playbook.png) |
-| Cloud Run | ![Cloud Run service](docs/screenshots/08-cloud-run.png) |
-| Latency | ![Stats endpoint](docs/screenshots/09-stats.png) |
 
 ---
 
