@@ -1,0 +1,230 @@
+# OpenAPI schema for the Conversational Agents Tool.
+#
+# Paste this into: Conversational Agents console -> your agent -> Tools ->
+# Create -> Type "OpenAPI" -> Schema.
+#
+# ONE EDIT REQUIRED: replace the servers.url below with your deployed
+# Cloud Run URL (scripts/deploy_cloud_run.sh prints it).
+#
+# The descriptions in this file are not documentation. They are the prompt
+# the model reads when deciding which tool to call and what to put in each
+# field. Vague descriptions produce wrong tool calls. Treat every
+# description string as production prompt surface and version it like code.
+
+openapi: 3.0.0
+info:
+  title: Optimum-style Customer Service Tools
+  description: Account lookup, outage status, and technician dispatch for a support agent.
+  version: 1.0.0
+
+servers:
+  - url: https://REPLACE-WITH-YOUR-CLOUD-RUN-URL
+
+paths:
+  /tools/account-status:
+    post:
+      operationId: get_account_status
+      summary: Look up a customer's plan, balance and service status.
+      description: >
+        Call this as soon as the customer has given an account ID. Returns the
+        plan name, current balance, due date, autopay setting, service ZIP and
+        whether service is active, degraded or suspended. Read-only and safe to
+        call. Do not guess an account ID; ask the customer for it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id]
+              properties:
+                account_id:
+                  type: string
+                  description: Account ID in the format OPT- followed by 8 digits, e.g. OPT-10045512.
+      responses:
+        "200":
+          description: Account found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  account_id: { type: string }
+                  plan: { type: string }
+                  service_status:
+                    type: string
+                    description: One of active, degraded, suspended_nonpayment.
+                  balance_due_usd: { type: number }
+                  due_date: { type: string }
+                  autopay_enabled: { type: boolean }
+                  service_zip: { type: string }
+                  open_tickets: { type: integer }
+
+  /tools/outage-check:
+    post:
+      operationId: check_outage
+      summary: Check whether there is a known network outage in a ZIP code.
+      description: >
+        Call this before troubleshooting any connectivity complaint. If an
+        outage is active, tell the customer the affected services and the
+        estimated restore time instead of walking them through equipment steps.
+        Read-only and safe to call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [zip_code]
+              properties:
+                zip_code:
+                  type: string
+                  description: The 5-digit service ZIP code for the customer's address.
+      responses:
+        "200":
+          description: Outage status for the ZIP code.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  zip_code: { type: string }
+                  outage_active: { type: boolean }
+                  incident_id: { type: string }
+                  services_affected:
+                    type: array
+                    items: { type: string }
+                  estimated_restore: { type: string }
+                  cause: { type: string }
+
+  /tools/appointment-slots:
+    post:
+      operationId: list_appointment_slots
+      summary: List real technician arrival windows.
+      description: >
+        Call this before offering any appointment time. Never invent a date or
+        window; only offer slots returned by this tool. Read-only and safe to call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [zip_code]
+              properties:
+                zip_code:
+                  type: string
+                  description: The 5-digit service ZIP code.
+      responses:
+        "200":
+          description: Available slots.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  zip_code: { type: string }
+                  slots:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: { type: string }
+                        window: { type: string }
+
+  /tools/schedule-technician:
+    post:
+      operationId: schedule_technician
+      summary: Book a technician visit. Changes the customer's account.
+      description: >
+        This dispatches a truck. Only call it after you have offered the
+        customer a specific date and window from list_appointment_slots AND the
+        customer has agreed in their own words. Set confirm to true only in that
+        case. If you call this with confirm false it will be rejected, which is
+        intended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id, preferred_date, window, confirm]
+              properties:
+                account_id:
+                  type: string
+                  description: Account ID in the format OPT- followed by 8 digits.
+                preferred_date:
+                  type: string
+                  description: Date in YYYY-MM-DD format, taken from list_appointment_slots.
+                window:
+                  type: string
+                  description: Arrival window exactly as returned by list_appointment_slots.
+                confirm:
+                  type: boolean
+                  description: True only after explicit customer agreement to this date and window.
+      responses:
+        "200":
+          description: Appointment booked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  confirmation_number: { type: string }
+                  account_id: { type: string }
+                  date: { type: string }
+                  window: { type: string }
+        "409":
+          description: Confirmation was not obtained. Ask the customer, then retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  error_code: { type: string }
+                  message: { type: string }
+
+  /tools/escalate:
+    post:
+      operationId: escalate_to_human
+      summary: Hand the conversation to a human representative.
+      description: >
+        Call this when the customer asks for a person, when you have failed to
+        resolve the issue after two attempts, or when the customer is clearly
+        angry. Confirm with the customer first, then set confirm to true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id, reason, confirm]
+              properties:
+                account_id:
+                  type: string
+                  description: Account ID in the format OPT- followed by 8 digits.
+                reason:
+                  type: string
+                  description: One sentence on why a human is needed. No customer PII beyond the account ID.
+                sentiment:
+                  type: string
+                  description: One of neutral, frustrated, angry. Drives queue routing.
+                confirm:
+                  type: boolean
+                  description: True only after the customer has agreed to be transferred.
+      responses:
+        "200":
+          description: Escalation ticket created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  ticket_id: { type: string }
+                  queue: { type: string }

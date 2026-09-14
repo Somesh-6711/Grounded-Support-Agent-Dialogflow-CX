@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Test
+        run: pytest tests -q
+      - name: Validate OpenAPI tool schema
+        run: |
+          pip install openapi-spec-validator pyyaml
+          python -c "
+          import yaml
+          from openapi_spec_validator import validate
+          spec = yaml.safe_load(open('openapi/tools.yaml'))
+          validate(spec)
+          ops = [op['operationId'] for p in spec['paths'].values() for op in p.values()]
+          print('valid; operations:', ', '.join(sorted(ops)))
+          "
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container
+        run: docker build -t ces-tool-service:${{ github.sha }} .
